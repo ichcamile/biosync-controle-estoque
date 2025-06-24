@@ -1,9 +1,17 @@
 import tkinter as tk
 from tkinter import messagebox, ttk
-import sqlite3
+import mysql.connector
+from mysql.connector import Error
 from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
+
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'your_mysql_user',
+    'password': 'your_mysql_password',
+    'database': 'estoque_biosync'
+}
 
 class ControleEstoqueApp:
     def __init__(self, master):
@@ -19,45 +27,57 @@ class ControleEstoqueApp:
         self.create_login_ui()
 
     def _get_db_connection(self):
-        self.conn = sqlite3.connect('estoque_biosync.db')
-        self.conn.row_factory = sqlite3.Row
-        return self.conn
+        try:
+            conn = mysql.connector.connect(**DB_CONFIG)
+            if conn.is_connected():
+                return conn
+            else:
+                messagebox.showerror("Erro de Conexão", "Não foi possível conectar ao banco de dados MySQL.")
+                self.master.destroy()
+                return None
+        except Error as e:
+            messagebox.showerror("Erro de Conexão", f"Erro ao conectar ao MySQL: {e}")
+            self.master.destroy()
+            return None
 
     def _init_db(self):
         conn = self._get_db_connection()
+        if not conn:
+            return
+
         cursor = conn.cursor()
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                description TEXT,
-                current_quantity INTEGER NOT NULL DEFAULT 0,
-                min_quantity INTEGER NOT NULL DEFAULT 0
-            )
-        ''')
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS stock_movements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_id INTEGER NOT NULL,
-                type TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                movement_date TEXT NOT NULL,
-                FOREIGN KEY (product_id) REFERENCES products(id)
-            )
-        ''')
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password TEXT NOT NULL,
-                role TEXT NOT NULL
-            )
-        ''')
-
         try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(255) NOT NULL UNIQUE,
+                    password VARCHAR(255) NOT NULL,
+                    role VARCHAR(50) NOT NULL CHECK(role IN ('admin', 'comum'))
+                );
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS products (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL UNIQUE,
+                    description TEXT,
+                    current_quantity INT NOT NULL DEFAULT 0 CHECK(current_quantity >= 0),
+                    min_quantity INT NOT NULL DEFAULT 0 CHECK(min_quantity >= 0)
+                );
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS stock_movements (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    product_id INT NOT NULL,
+                    type VARCHAR(50) NOT NULL CHECK(type IN ('entrada', 'saida')),
+                    quantity INT NOT NULL CHECK(quantity > 0),
+                    movement_date DATETIME NOT NULL,
+                    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+                );
+            ''')
+
             cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
             if cursor.fetchone()[0] == 0:
                 admin_username = "admin"
@@ -65,40 +85,54 @@ class ControleEstoqueApp:
                 hashed_password = generate_password_hash(admin_password)
 
                 cursor.execute(
-                    "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+                    "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
                     (admin_username, hashed_password, 'admin')
                 )
                 conn.commit()
                 print("Usuário administrador padrão criado (admin/adminpass).")
             else:
                 print("Usuário administrador já existe.")
-        except Exception as e:
-            print(f"Erro ao garantir usuário admin: {e}")
 
-        conn.commit()
-        conn.close()
+        except Error as e:
+            print(f"Erro ao inicializar o banco de dados ou garantir usuário admin: {e}")
+            messagebox.showerror("Erro no DB", f"Não foi possível inicializar o banco de dados: {e}")
+            self.master.destroy()
+        finally:
+            if cursor:
+                cursor.close()
+            if conn and conn.is_connected():
+                conn.close()
 
-    def _execute_query(self, query, params=()):
+    def _execute_query(self, query, params=(), fetch_one=False):
         conn = self._get_db_connection()
-        cursor = conn.cursor()
+        if not conn:
+            return None
+
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        results = None
         try:
             cursor.execute(query, params)
             conn.commit()
-            results = cursor.fetchall() if query.strip().lower().startswith(('select', 'pragma')) else None
-            return results
-        except sqlite3.IntegrityError as e:
-            raise ValueError(f"Erro de integridade: {e}")
-        except Exception as e:
-            raise Exception(f"Erro ao executar query: {e}")
+
+            if query.strip().lower().startswith('select'):
+                results = cursor.fetchone() if fetch_one else cursor.fetchall()
+        except Error as e:
+            if "Duplicate entry" in str(e) and ("for key 'username'" in str(e) or "for key 'name'" in str(e)):
+                 raise ValueError(f"Erro de integridade: Nome já existe ou duplicado.")
+            else:
+                raise Exception(f"Erro ao executar query: {e}")
         finally:
-            if conn:
+            if cursor:
+                cursor.close()
+            if conn and conn.is_connected():
                 conn.close()
+        return results
 
     def _authenticate_user(self, username, password):
-        user = self._execute_query("SELECT id, username, password, role FROM users WHERE username = ?", (username,))
+        user = self._execute_query("SELECT id, username, password, role FROM users WHERE username = %s", (username,), fetch_one=True)
         if user:
-            if check_password_hash(user[0]['password'], password):
-                return user[0]['id'], user[0]['role']
+            if check_password_hash(user['password'], password):
+                return user['id'], user['role']
         return None, None
 
     def _register_user(self, username, password, role):
@@ -108,14 +142,12 @@ class ControleEstoqueApp:
         hashed_password = generate_password_hash(password)
         try:
             self._execute_query(
-                "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+                "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
                 (username, hashed_password, role)
             )
             return True, "Usuário registrado com sucesso."
         except ValueError as e:
-            if "UNIQUE constraint failed" in str(e):
-                return False, "Nome de usuário já existe."
-            return False, f"Erro: {e}"
+            return False, str(e)
         except Exception as e:
             return False, f"Erro inesperado: {e}"
 
@@ -131,14 +163,12 @@ class ControleEstoqueApp:
 
         try:
             self._execute_query(
-                "INSERT INTO products (name, description, min_quantity) VALUES (?, ?, ?)",
+                "INSERT INTO products (name, description, min_quantity) VALUES (%s, %s, %s)",
                 (name, description, min_quantity)
             )
             return True, "Produto adicionado com sucesso."
         except ValueError as e:
-            if "UNIQUE constraint failed" in str(e):
-                return False, "Já existe um produto com este nome."
-            return False, f"Erro: {e}"
+            return False, str(e)
         except Exception as e:
             return False, f"Erro inesperado: {e}"
 
@@ -157,14 +187,12 @@ class ControleEstoqueApp:
 
         try:
             self._execute_query(
-                "UPDATE products SET name = ?, description = ?, min_quantity = ? WHERE id = ?",
+                "UPDATE products SET name = %s, description = %s, min_quantity = %s WHERE id = %s",
                 (name, description, min_quantity, product_id)
             )
             return True, "Produto atualizado com sucesso."
         except ValueError as e:
-            if "UNIQUE constraint failed" in str(e):
-                return False, "Já existe outro produto com este nome."
-            return False, f"Erro: {e}"
+            return False, str(e)
         except Exception as e:
             return False, f"Erro inesperado: {e}"
 
@@ -177,16 +205,16 @@ class ControleEstoqueApp:
             return False, "Quantidade deve ser um número inteiro."
 
         try:
-            product = self._execute_query("SELECT current_quantity FROM products WHERE id = ?", (product_id,))
+            product = self._execute_query("SELECT current_quantity FROM products WHERE id = %s", (product_id,), fetch_one=True)
             if not product:
                 return False, "Produto não encontrado."
 
-            current_quantity = product[0]['current_quantity']
+            current_quantity = product['current_quantity']
             new_quantity = current_quantity + quantity
 
-            self._execute_query("UPDATE products SET current_quantity = ? WHERE id = ?", (new_quantity, product_id))
+            self._execute_query("UPDATE products SET current_quantity = %s WHERE id = %s", (new_quantity, product_id))
             self._execute_query(
-                "INSERT INTO stock_movements (product_id, type, quantity, movement_date) VALUES (?, ?, ?, ?)",
+                "INSERT INTO stock_movements (product_id, type, quantity, movement_date) VALUES (%s, %s, %s, %s)",
                 (product_id, 'entrada', quantity, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
             return True, "Entrada de estoque registrada com sucesso."
@@ -202,19 +230,19 @@ class ControleEstoqueApp:
             return False, "Quantidade deve ser um número inteiro."
 
         try:
-            product = self._execute_query("SELECT current_quantity FROM products WHERE id = ?", (product_id,))
+            product = self._execute_query("SELECT current_quantity FROM products WHERE id = %s", (product_id,), fetch_one=True)
             if not product:
                 return False, "Produto não encontrado."
 
-            current_quantity = product[0]['current_quantity']
+            current_quantity = product['current_quantity']
             if current_quantity < quantity:
                 return False, "Quantidade insuficiente em estoque."
 
             new_quantity = current_quantity - quantity
 
-            self._execute_query("UPDATE products SET current_quantity = ? WHERE id = ?", (new_quantity, product_id))
+            self._execute_query("UPDATE products SET current_quantity = %s WHERE id = %s", (new_quantity, product_id))
             self._execute_query(
-                "INSERT INTO stock_movements (product_id, type, quantity, movement_date) VALUES (?, ?, ?, ?)",
+                "INSERT INTO stock_movements (product_id, type, quantity, movement_date) VALUES (%s, %s, %s, %s)",
                 (product_id, 'saida', quantity, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             )
             return True, "Saída de estoque registrada com sucesso."
@@ -410,12 +438,15 @@ class ControleEstoqueApp:
             self.user_tree.delete(item)
 
         conn = self._get_db_connection()
-        cursor = conn.cursor()
-        users = cursor.execute("SELECT id, username, role FROM users").fetchall()
+        if not conn:
+            return
+        cursor = conn.cursor(dictionary=True) # Usar dictionary=True para acesso por nome de coluna
+        users = self._execute_query("SELECT id, username, role FROM users") # Não precisa de fetchall() aqui
         conn.close()
 
-        for u in users:
-            self.user_tree.insert("", "end", values=(u['id'], u['username'], u['role']))
+        if users:
+            for u in users:
+                self.user_tree.insert("", "end", values=(u['id'], u['username'], u['role']))
 
     def _clear_product_form(self):
         self.product_name_entry.delete(0, tk.END)
@@ -444,11 +475,12 @@ class ControleEstoqueApp:
             self.product_tree.delete(item)
 
         products = self._get_all_products()
-        for p in products:
-            tags = ()
-            if p['current_quantity'] <= p['min_quantity'] and p['min_quantity'] > 0:
-                tags = ('low_stock',)
-            self.product_tree.insert("", "end", values=(p['id'], p['name'], p['description'], p['current_quantity'], p['min_quantity']), tags=tags)
+        if products:
+            for p in products:
+                tags = ()
+                if p['current_quantity'] <= p['min_quantity'] and p['min_quantity'] > 0:
+                    tags = ('low_stock',)
+                self.product_tree.insert("", "end", values=(p['id'], p['name'], p['description'], p['current_quantity'], p['min_quantity']), tags=tags)
 
         self.product_tree.tag_configure('low_stock', background='red', foreground='white')
 
