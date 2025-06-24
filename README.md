@@ -1,0 +1,1 @@
+# biosync-controle-estoque
